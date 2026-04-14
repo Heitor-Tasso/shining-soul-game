@@ -46,6 +46,21 @@ class GameSettings:
         return self.screen_width, self.screen_height
 
 
+@dataclass(frozen=True)
+class VoxelSettings:
+    """Static configuration for the voxel 2.5D runtime systems."""
+
+    grid_w: int = 128
+    grid_h: int = 96
+    grid_d: int = 8
+    tile_size: int = 32
+    chunk_size: int = 16
+    max_particles: int = 100
+    particle_static_age: float = 120.0
+    regen_enabled: bool = True
+    regen_interval: float = 600.0
+
+
 GAME_SETTINGS = GameSettings(
     root_dir=ROOT_DIR,
     assets_dir=ROOT_DIR / "assets",
@@ -54,6 +69,8 @@ GAME_SETTINGS = GameSettings(
     fps=_env_int("FPS", 60),
     ui_font=os.getenv("UI_FONT", "Rosewood Std"),
 )
+
+VOXEL_SETTINGS = VoxelSettings()
 
 
 def asset_path(*parts: str) -> Path:

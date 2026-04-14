@@ -89,6 +89,40 @@ def draw_enemy(
             frame_enemy_status[index][2] -= 1
 
 
+def draw_single_enemy(
+    screen,
+    enemy_pic,
+    frame_enemy_status,
+    enemy_status,
+    enemy_sprite_modes,
+    enemy_lock,
+    screen_enemy_x,
+    screen_enemy_y,
+    enemy_frame_delay: int,
+    index: int,
+) -> None:
+    """Draw one enemy sprite instance for custom depth ordering flows."""
+    if not (0 <= index < len(screen_enemy_x)):
+        return
+
+    if (frame_enemy_status[index][0], frame_enemy_status[index][1]) != (0, 0):
+        direction_index = direction_to_index(frame_enemy_status[index])
+        mode_index = sprite_mode_index(enemy_status[index], "enemy", [], enemy_sprite_modes)
+        frame_sequence = enemy_pic[direction_index][mode_index]
+        character_blit(
+            screen,
+            frame_sequence[frame_enemy_status[index][3]],
+            (screen_enemy_x[index], screen_enemy_y[index]),
+            enemy_lock[direction_index][mode_index],
+            enemy_sprite_size(frame_enemy_status[index]) or (130, 130),
+        )
+        if frame_enemy_status[index][2] == 0:
+            frame_enemy_status[index][2] += enemy_frame_delay
+            frame_enemy_status[index][3] = (frame_enemy_status[index][3] + 1) % len(frame_sequence)
+    if frame_enemy_status[index][2] > 0:
+        frame_enemy_status[index][2] -= 1
+
+
 def draw_knife(screen, self_knife: list[list], self_pic, knife_range: int) -> None:
     """Draw active knife projectiles and remove expired ones."""
     for knife in list(self_knife):
@@ -123,3 +157,37 @@ def draw_blade_block(screen, blade_block_pic, show_block: list[int], self_x: int
         if show_block[index] > 0:
             screen.blit(blade_block_pic, (self_x - 50, self_y - 100))
             show_block[index] -= 1
+
+
+def draw_particle(
+    screen,
+    x: float,
+    y: float,
+    size: float,
+    color: tuple[int, int, int],
+    alpha: int = 255,
+) -> None:
+    """Draw one debris particle as a tiny diamond sprite."""
+    radius = max(1, int(size))
+    points = [
+        (int(x), int(y - radius)),
+        (int(x + radius), int(y)),
+        (int(x), int(y + radius)),
+        (int(x - radius), int(y)),
+    ]
+    if alpha >= 255:
+        draw.polygon(screen, color, points)
+        return
+
+    # Pygame draw.* ignores per-primitive alpha on display surfaces.
+    # Draw to a tiny temporary alpha surface and blit it back.
+    from pygame import SRCALPHA, Surface
+
+    pad = radius + 2
+    temp = Surface((pad * 2, pad * 2), SRCALPHA)
+    shifted = [
+        (point_x - int(x) + pad, point_y - int(y) + pad)
+        for point_x, point_y in points
+    ]
+    draw.polygon(temp, (*color, alpha), shifted)
+    screen.blit(temp, (int(x) - pad, int(y) - pad))

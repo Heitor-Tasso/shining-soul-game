@@ -20,6 +20,22 @@ cp .env.example .env
 uv run python main.py
 ```
 
+## Comandos de debug em runtime
+
+Esses comandos aparecem no HUD durante a partida:
+
+- V: alterna entre visual Legacy e Voxel
+- H: mostra/oculta ajuda de comandos
+- TAB: alterna zoom
+- T: mostra/oculta profiler
+- F1/F2/F3: overlays de grid/chunks/colisao
+- F4/F5: HUD de FPS/particulas
+- F6/F7: god mode/instant destroy
+- F8/F9: burst de particulas/step de regeneracao
+- F10/F11/F12: colocar bloco/limpar area/resetar overlay
+- 1..5: tipo de bloco
+- G/P/C: regen on-off/pausa fisica/limpa particulas
+
 ## Testes
 
 ```bash

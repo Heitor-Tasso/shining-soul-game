@@ -6,10 +6,14 @@ through modern project structure helpers.
 
 from pygame import *
 from random import *
+from time import perf_counter
 
-from config import GAME_SETTINGS, asset_path
+from config import GAME_SETTINGS, VOXEL_SETTINGS, asset_path
+from core.block_interaction import BlockInteractionSystem
 from core.camera import Camera
+from core.debug_controls import DebugControls
 from core.input import read_input
+from core.isometric import IsometricCamera, depth_sort_key
 from core.mechanics import (
     ai_move,
     choose_direction,
@@ -22,15 +26,20 @@ from core.mechanics import (
     move_self,
     sprite_mode_index,
 )
+from core.physics import ParticlePool
 from core.rendering import (
     character_blit as render_character_blit,
     draw_blade_block as render_draw_blade_block,
     draw_enemy as render_draw_enemy,
     draw_hp_bar as render_draw_hp_bar,
     draw_knife as render_draw_knife,
+    draw_particle as render_draw_particle,
     draw_round_label as render_draw_round_label,
+    draw_single_enemy as render_draw_single_enemy,
     draw_self as render_draw_self,
 )
+from core.voxel_renderer import BLOCK_COLORS, VoxelWorldRenderer
+from core.world_grid import BlockType, GridConfig, VoxelGrid
 from core.screens import (
     apply_levelup_option,
     gameover_hover_option,
@@ -213,17 +222,64 @@ def selfrege():#selfregeneration
     if regecounter>59 and selfstatus[2]<selfhp:
         selfstatus[2]+=1
         regecounter=0
+
+
+def dynamic_block_rects_near(world_x, world_y, radius=220):
+    """Return legacy map collisions plus nearby dynamic voxel collisions."""
+    if "voxel_grid" in globals() and voxel_grid is not None:
+        dynamic_rects = voxel_grid.get_collision_rects_near(world_x, world_y, radius)
+        if dynamic_rects:
+            return mapblockrect + dynamic_rects
+    return mapblockrect
+
+
+def blit_world_with_zoom(target_surface, world_surface, zoom_factor):
+    """Blit world layer onto target applying centered zoom."""
+    if abs(zoom_factor - 1.0) < 0.001:
+        target_surface.blit(world_surface, (0, 0))
+        return
+
+    scaled_w = max(1, int(resolution[0] * zoom_factor))
+    scaled_h = max(1, int(resolution[1] * zoom_factor))
+    scaled_world = transform.smoothscale(world_surface, (scaled_w, scaled_h))
+    offset_x = (resolution[0] - scaled_w) // 2
+    offset_y = (resolution[1] - scaled_h) // 2
+    target_surface.blit(scaled_world, (offset_x, offset_y))
+
+
+def draw_legacy_background(target_surface):
+    """Draw the original 2D map layer so voxel mode never renders a black frame."""
+    (_psx,_psy,legacy_map_x,legacy_map_y,_ssx,_ssy,_sex,_sey,legacy_tree_x,legacy_tree_y,_sblock,_knife)=screenoutputdata(
+        mapselfx,
+        mapselfy,
+        mapenemyx,
+        mapenemyy,
+        maptreex,
+        maptreey,
+        mapblockrect,
+        mapsize,
+        selfknife,
+    )
+    target_surface.blit(gamemap,(legacy_map_x,legacy_map_y))
+    for i in range(len(legacy_tree_x)):
+        target_surface.blit(treepic,(legacy_tree_x[i],legacy_tree_y[i]+200))
+    for i in range(len(legacy_tree_x)):
+        target_surface.blit(ballpic,(legacy_tree_x[i],legacy_tree_y[i]))
+
+
 def enemymove():#use choosedirect,getdirect,AImove to move enemy
     global mapenemyx,mapenemyy,enemydirect,enemystatus
     for i in range(len(mapenemyx)):
         if enemystatus[i][4]=="move":
-            enemydirect[i]=choosedirect(getdirect(mapenemyx[i],mapenemyy[i],mapselfx,mapselfy),mapselfx,mapselfy,mapenemyx[i],mapenemyy[i],mapenemyx,mapenemyy,mapblockrect,enemysize,venemy)
+            local_block_rects = dynamic_block_rects_near(mapenemyx[i], mapenemyy[i], radius=240)
+            enemydirect[i]=choosedirect(getdirect(mapenemyx[i],mapenemyy[i],mapselfx,mapselfy),mapselfx,mapselfy,mapenemyx[i],mapenemyy[i],mapenemyx,mapenemyy,local_block_rects,enemysize,venemy)
             enemystatus[i][0],enemystatus[i][1]=enemydirect[i][0],enemydirect[i][1]
             mapenemyx[i],mapenemyy[i]=AImove(mapselfx,mapselfy,mapenemyx[i],mapenemyy[i],venemy,enemydirect[i])
 def selfmove():#use moveself() to move the character
     global selfstatus,mapselfx,mapselfy
     if selfstatus[4]=="move":
-        mapselfx,mapselfy=moveself(mapselfx,mapselfy,mapenemyx,mapenemyy,enemysize,mapblockrect)
+        local_block_rects = dynamic_block_rects_near(mapselfx, mapselfy, radius=240)
+        mapselfx,mapselfy=moveself(mapselfx,mapselfy,mapenemyx,mapenemyy,enemysize,local_block_rects)
         if (selfdirectionx,selfdirectiony)!=(0,0):
             selfstatus[0],selfstatus[1]=selfdirectionx,selfdirectiony
 def getframedata():#get the information from status in order to draw the character/enemy
@@ -260,7 +316,7 @@ def AIatk():#if mode of enemy is deal damage, deal damage to the same direction 
                 blocksound.play()
 def dartmodeatk():#check if the dart hit or not in dart mode
     """Spawn, move and resolve dart projectile collisions."""
-    global selfstatus,selfknife,enemystatus,frameenemystatus
+    global selfstatus,selfknife,enemystatus,frameenemystatus,block_interaction
     if selfstatus[5]==1 and selfstatus[4]=="atk" and selfstatus[3]==selfdartatkcd-1:#create dart
         selfknife.append([selfstatus[0],selfstatus[1],mapselfx,mapselfy,0,0,0,0])
         knifesound.play()
@@ -270,7 +326,8 @@ def dartmodeatk():#check if the dart hit or not in dart mode
         else:
             n[2],n[3]=n[2]+n[0]*vknife,n[3]+n[1]*vknife
         n[7]=midpointrect(n[2],n[3],knifesize,knifesize)
-    for n in selfknife:#deals damage
+    for n in list(selfknife):#deals damage
+        hit_enemy=False
         for i in range(len(mapenemyx)):
             if n[7].colliderect(midpointrect(mapenemyx[i],mapenemyy[i],enemysize,enemysize)):
                 hitsound.play()
@@ -278,11 +335,19 @@ def dartmodeatk():#check if the dart hit or not in dart mode
                 enemystatus[i][2]-=selfdartatk
                 enemystatus[i][4]="damage"
                 frameenemystatus[i][3]=0
-                del selfknife[selfknife.index(n)]
+                if n in selfknife:
+                    selfknife.remove(n)
+                hit_enemy=True
                 break
+        if hit_enemy:
+            continue
+        if block_interaction is not None and block_interaction.projectile_hit_block(n[2], n[3]):
+            hitsound.play()
+            if n in selfknife:
+                selfknife.remove(n)
 def blademodeatk():#checks if deals damage to enemy on blade mode
     """Resolve melee blade damage and life-steal when attack hitbox collides."""
-    global selfstatus, enemystatus, frameenemystatus,mapselfatkrect
+    global selfstatus, enemystatus, frameenemystatus,mapselfatkrect,block_interaction,debug_controls
     if selfstatus[4]=="atk" and selfstatus[5]==0:
         mapselfatkrect=midpointrect(mapselfx+selfstatus[0]*selfsize,mapselfy+selfstatus[1]*selfsize,selfatkrange,selfatkrange)
         if selfstatus[3]==10:
@@ -298,6 +363,16 @@ def blademodeatk():#checks if deals damage to enemy on blade mode
                 if selfstatus[2]>selfhp:
                     selfstatus[2]=selfhp
                 frameenemystatus[i][3]=0
+    if mapselfatkrect!=0 and oselfstatus[4]!="atk" and selfstatus[4]=="atk" and block_interaction is not None:
+        hit = block_interaction.attack_block(
+            mapselfx,
+            mapselfy,
+            (selfstatus[0], selfstatus[1]),
+            selfatkrange,
+            damage=2 if debug_controls is not None and debug_controls.instant_destroy else 1,
+        )
+        if hit:
+            hitsound.play()
 def allbacktorange():#use backtorange to both enemy and character
     global mapselfx,mapselfy,mpenenyx,mpenemyy
     mapselfx,mapselfy=backtorange(mapselfx,mapselfy,selfsize,mapsize)
@@ -334,7 +409,7 @@ def allreset():#reset everything when you restart the game
     global mapenemyx,mapenemyy,mapenemyox,mapenemyoy,screnemyx,screnemyy,vself,venemy,vknife,selfsize,enemysize,selfhp,enemyhp,selfstatus,enemystatus,oenemystatus
     global selfatkrange,enemyatkrange,selfbladeatkcd,selfdartatkcd,selfbladeatkstun,selfdartatkstun,enemypreatkstun,enemyatkcd,enemyatkstun,knifesize,kniferange,selfdirectionx,selfdirectiony
     global enemyatk,selfbladeatk,selfdartatk,mapsize,selflevel,gamelevel,enemydirect,frameselfstatus,selfframedelay,frameenemystatus,enemyframedelay
-    global skill_tree
+    global skill_tree,voxel_grid,iso_camera,particle_pool,voxel_renderer,block_interaction,debug_controls
     mapx,mapy=0,0
     mapselfx,mapselfy=400,300
     mapselfox,mapselfoy=0,0
@@ -392,6 +467,27 @@ def allreset():#reset everything when you restart the game
     for i in range(len(mapenemyx)):
         frameenemystatus[i]=[0,0,0,0]#dx,dy,frstun,frame
     skill_tree=SkillTree()
+
+    if voxel_grid is not None:
+        voxel_grid.init_empty_world()
+    if voxel_renderer is not None:
+        voxel_renderer.chunk_cache.invalidate_all()
+    if particle_pool is not None:
+        particle_pool.clear_all()
+    if block_interaction is not None:
+        block_interaction.regen_enabled = VOXEL_SETTINGS.regen_enabled
+    if debug_controls is not None:
+        debug_controls.god_mode = False
+        debug_controls.instant_destroy = False
+        debug_controls.physics_paused = False
+        debug_controls.use_voxel_view = False
+        debug_controls.show_command_help = True
+        debug_controls.show_profiler = False
+        debug_controls.zoom_index = 1
+        debug_controls.zoom_factor = debug_controls.zoom_levels[debug_controls.zoom_index]
+        debug_controls.clear_frame_profile()
+        debug_controls.set_terrain_seed_positions(list(zip(maptreex, maptreey)))
+
     mixer.music.load(asset_path("sound", "background.wav"))
     mixer.music.play(-1)
 def roundreset():#reset the enemys and their status at the beginning of each round
@@ -400,7 +496,7 @@ def roundreset():#reset the enemys and their status at the beginning of each rou
     global mapenemyx,mapenemyy,mapenemyox,mapenemyoy,screnemyx,screnemyy,vself,venemy,vknife,selfsize,enemysize,selfhp,enemyhp,selfstatus,enemystatus,oenemystatus
     global selfatkrange,enemyatkrange,selfbladeatkcd,selfdartatkcd,selfbladeatkstun,selfdartatkstun,enemypreatkstun,enemyatkcd,enemyatkstun,knifesize,kniferange,selfdirectionx,selfdirectiony
     global enemyatk,selfbladeatk,selfdartatk,mapsize,selflevel,gamelevel,enemydirect,frameselfstatus,selfframedelay,frameenemystatus,enemyframedelay,endingpic,scrmode
-    global scrmode,skill_tree
+    global scrmode,skill_tree,particle_pool
     endingpic=screen.subsurface(Rect(0,0,resolution[0],resolution[1])).copy()
     venemy=2+0.08*gamelevel
     if venemy>5:
@@ -421,6 +517,8 @@ def roundreset():#reset the enemys and their status at the beginning of each rou
     scrmode="levelup"
     if gamelevel%5==0 and ogamelevel!=gamelevel:#every 5 level you get a credit
         skill_tree.move_speedup_credit+=1
+    if particle_pool is not None:
+        particle_pool.clear_non_static()
     levelupsound.play()
 def levelup():#the levelup screen of the game
     """Handle level-up UI interactions and apply selected skill upgrades."""
@@ -501,8 +599,21 @@ def mainloop():#the main program of the game
     """Execute one frame of gameplay state update and rendering."""
     global mapselfatkrect,keys,mapselfx,mapselfy,mapx,mapy,scrselfx,scrselfy,screnemyx,screnemyy,scrtreex,scrtreey,scrblockrect,selfknife
     global mapselfox,mapselfoy,mapenemyox,mapenemyoy,okeys,selfdirectionx,selfdirectiony,oselfstatus,oenemystatus
+    global voxel_grid,iso_camera,particle_pool,voxel_renderer,block_interaction,debug_controls,ogamelevel,world_surface
+
+    frame_start = perf_counter()
+    phase_clock = frame_start
+    frame_profile: dict[str, float] = {}
+
+    def mark_profile(label: str) -> None:
+        nonlocal phase_clock
+        now = perf_counter()
+        frame_profile[label] = (now - phase_clock) * 1000.0
+        phase_clock = now
+
     mapselfox,mapselfoy=mapselfx,mapselfy
     mapenemyox,mapenemyoy=mapenemyx[:],mapenemyy[:]
+    # Snapshot previous frame state; debug key reader now handles out-of-range Fx safely.
     okeys=tuple(keys)
     ogamelevel=gamelevel
     selfdirectionx,selfdirectiony=0,0
@@ -511,6 +622,10 @@ def mainloop():#the main program of the game
         oenemystatus[i]=enemystatus[i][:] 
     mapselfatkrect=0
     keys = key.get_pressed()
+    if debug_controls is not None:
+        debug_controls.set_player_context(mapselfx, mapselfy, (selfstatus[0], selfstatus[1]))
+        debug_controls.process_input(keys, okeys)
+    mark_profile("input")
     #####map analyzing#####
     nuke()
     if checkallclear()==True:
@@ -523,25 +638,234 @@ def mainloop():#the main program of the game
     AIatk()
     dartmodeatk()
     blademodeatk()
+
+    if debug_controls is not None and debug_controls.god_mode:
+        selfstatus[2]=selfhp
+
+    if particle_pool is not None and voxel_grid is not None and (debug_controls is None or not debug_controls.physics_paused):
+        particle_pool.update(grid=voxel_grid)
+
+    if block_interaction is not None and voxel_grid is not None:
+        occupied = []
+        occupied.append((int(mapselfx // voxel_grid.config.tile_size), int(mapselfy // voxel_grid.config.tile_size), 1))
+        for i in range(len(mapenemyx)):
+            occupied.append((int(mapenemyx[i] // voxel_grid.config.tile_size), int(mapenemyy[i] // voxel_grid.config.tile_size), 1))
+        block_interaction.update_regeneration(occupied_positions=occupied)
+
     allbacktorange()
     framereset()
+    mark_profile("update")
+
     #------------------start drawing everything------------#
     getframedata()
-    mapselfx,mapselfy,mapx,mapy,scrselfx,scrselfy,screnemyx,screnemyy,scrtreex,scrtreey,scrblockrect,selfknife=screenoutputdata(mapselfx,mapselfy,mapenemyx,mapenemyy,maptreex,maptreey,mapblockrect,mapsize,selfknife)
     screen.fill((0,0,0))
-    screen.blit(gamemap,(mapx,mapy))
-    for i in range(len(scrtreex)):
-        screen.blit(treepic,(scrtreex[i],scrtreey[i]+200))
-    drawself()
-    drawknife()
-    drawenemy()
-    for i in range(len(scrtreex)):
-        screen.blit(ballpic,(scrtreex[i],scrtreey[i]))
+
+    use_voxel_pipeline = (
+        voxel_grid is not None
+        and iso_camera is not None
+        and voxel_renderer is not None
+        and debug_controls is not None
+        and debug_controls.use_voxel_view
+    )
+    if use_voxel_pipeline:
+        world_surface.fill((0, 0, 0, 0))
+        draw_target = world_surface
+        draw_legacy_background(draw_target)
+        iso_camera.update(
+            mapselfx,
+            mapselfy,
+            voxel_grid.config.grid_w,
+            voxel_grid.config.grid_h,
+            voxel_grid.config.tile_size,
+        )
+        renderables = []
+        tile_size = voxel_grid.config.tile_size
+
+        player_screen = iso_camera.world_to_screen(mapselfx, mapselfy, gz=1.0, tile_size=tile_size)
+        renderables.append(
+            (
+                depth_sort_key(mapselfx / tile_size, mapselfy / tile_size, 1.0),
+                "player",
+                int(player_screen[0]),
+                int(player_screen[1]),
+            )
+        )
+
+        screnemyx = [0] * len(mapenemyx)
+        screnemyy = [0] * len(mapenemyx)
+        for i in range(len(mapenemyx)):
+            enemy_screen = iso_camera.world_to_screen(mapenemyx[i], mapenemyy[i], gz=1.0, tile_size=tile_size)
+            renderables.append(
+                (
+                    depth_sort_key(mapenemyx[i] / tile_size, mapenemyy[i] / tile_size, 1.0),
+                    "enemy",
+                    i,
+                    int(enemy_screen[0]),
+                    int(enemy_screen[1]),
+                )
+            )
+
+        for knife in selfknife:
+            knife_screen = iso_camera.world_to_screen(knife[2], knife[3], gz=1.5, tile_size=tile_size)
+            renderables.append(
+                (
+                    depth_sort_key(knife[2] / tile_size, knife[3] / tile_size, 1.5),
+                    "knife",
+                    knife,
+                    int(knife_screen[0]),
+                    int(knife_screen[1]),
+                )
+            )
+
+        if particle_pool is not None:
+            for particle in particle_pool.active_particles():
+                particle_screen = iso_camera.grid_to_screen(particle.x, particle.y, particle.z)
+                if not iso_camera.is_on_screen(particle_screen[0], particle_screen[1], margin=96):
+                    continue
+
+                try:
+                    particle_type = BlockType(particle.block_type)
+                except ValueError:
+                    particle_type = BlockType.STONE
+
+                particle_color = BLOCK_COLORS.get(particle_type, (255, 255, 255))
+                age_ratio = min(1.0, particle.age / 600.0)
+                particle_size = max(1, int(particle.size * (1.0 - age_ratio * 0.6)))
+                particle_alpha = 150 if particle.is_static else 255
+                renderables.append(
+                    (
+                        depth_sort_key(particle.x, particle.y, particle.z),
+                        "particle",
+                        int(particle_screen[0]),
+                        int(particle_screen[1]),
+                        particle_size,
+                        particle_color,
+                        particle_alpha,
+                    )
+                )
+
+        dynamic_renderables = renderables
+        dynamic_renderables.sort(key=lambda item: item[0])
+
+        world_renderables = voxel_renderer.collect_depth_sorted_world_renderables()
+        merged_renderables = []
+        world_index = 0
+        dynamic_index = 0
+        while world_index < len(world_renderables) and dynamic_index < len(dynamic_renderables):
+            if world_renderables[world_index][0] <= dynamic_renderables[dynamic_index][0]:
+                merged_renderables.append(world_renderables[world_index])
+                world_index += 1
+            else:
+                merged_renderables.append(dynamic_renderables[dynamic_index])
+                dynamic_index += 1
+        if world_index < len(world_renderables):
+            merged_renderables.extend(world_renderables[world_index:])
+        if dynamic_index < len(dynamic_renderables):
+            merged_renderables.extend(dynamic_renderables[dynamic_index:])
+
+        knives_to_remove = []
+        for render_item in merged_renderables:
+            kind = render_item[1]
+            if kind == "block":
+                draw_target.blit(render_item[2], (render_item[3], render_item[4]))
+            elif kind == "player":
+                scrselfx, scrselfy = render_item[2], render_item[3]
+                render_draw_self(
+                    draw_target,
+                    selfpic,
+                    frameselfstatus,
+                    selfstatus,
+                    selfsprmode,
+                    lock,
+                    scrselfx,
+                    scrselfy,
+                    selfframedelay,
+                )
+            elif kind == "enemy":
+                enemy_index = render_item[2]
+                screnemyx[enemy_index], screnemyy[enemy_index] = render_item[3], render_item[4]
+                render_draw_single_enemy(
+                    draw_target,
+                    enemypic,
+                    frameenemystatus,
+                    enemystatus,
+                    enesprmode,
+                    enemylock,
+                    screnemyx,
+                    screnemyy,
+                    enemyframedelay,
+                    enemy_index,
+                )
+            elif kind == "knife":
+                knife_ref = render_item[2]
+                knife_ref[4], knife_ref[5] = render_item[3], render_item[4]
+                knife_frame = selfpic[direction_to_index(knife_ref)][11][0]
+                render_character_blit(draw_target, knife_frame, (knife_ref[4], knife_ref[5]), "mid", (50, 50))
+                knife_ref[6] += 1
+                if knife_ref[6] > kniferange:
+                    knives_to_remove.append(knife_ref)
+            elif kind == "particle":
+                render_draw_particle(
+                    draw_target,
+                    render_item[2],
+                    render_item[3],
+                    render_item[4],
+                    render_item[5],
+                    render_item[6],
+                )
+
+        for knife_ref in knives_to_remove:
+            if knife_ref in selfknife:
+                selfknife.remove(knife_ref)
+
+        if debug_controls is not None:
+            voxel_renderer.render_debug_overlay(
+                draw_target,
+                show_grid=debug_controls.show_grid_overlay,
+                show_chunks=debug_controls.show_chunk_borders,
+                show_collision=debug_controls.show_collision_rects,
+            )
+
+        zoom_factor = debug_controls.zoom_factor if debug_controls is not None else 1.0
+        blit_world_with_zoom(screen, world_surface, zoom_factor)
+    else:
+        mapselfx,mapselfy,mapx,mapy,scrselfx,scrselfy,screnemyx,screnemyy,scrtreex,scrtreey,scrblockrect,selfknife=screenoutputdata(mapselfx,mapselfy,mapenemyx,mapenemyy,maptreex,maptreey,mapblockrect,mapsize,selfknife)
+        screen.blit(gamemap,(mapx,mapy))
+        for i in range(len(scrtreex)):
+            screen.blit(treepic,(scrtreex[i],scrtreey[i]+200))
+
+        drawself()
+        drawknife()
+        drawenemy()
+        for i in range(len(scrtreex)):
+            screen.blit(ballpic,(scrtreex[i],scrtreey[i]))
+
+        if debug_controls is not None and voxel_renderer is not None and debug_controls.use_voxel_view:
+            voxel_renderer.render_debug_overlay(
+                screen,
+                show_grid=debug_controls.show_grid_overlay,
+                show_chunks=debug_controls.show_chunk_borders,
+                show_collision=debug_controls.show_collision_rects,
+            )
+
+    mark_profile("render")
+
     drawhpbar()
     drawround()
     drawbladeblock()
+
+    if debug_controls is not None:
+        debug_controls.render_hud(screen, myClock)
+
+    mark_profile("ui")
+
     myClock.tick(tick)
     display.flip()
+
+    mark_profile("present")
+    frame_profile["frame"] = (perf_counter() - frame_start) * 1000.0
+    if debug_controls is not None:
+        debug_controls.set_frame_profile(frame_profile)
 
     
 #-------------------initiating------------------------#
@@ -553,6 +877,7 @@ hpfont = font.SysFont(GAME_SETTINGS.ui_font, 35)
 resolution=GAME_SETTINGS.resolution
 camera = Camera(resolution)
 screen =display.set_mode(resolution)
+world_surface = Surface(resolution, SRCALPHA)
 blockpos=open(asset_path("blockpos.txt")).read().strip().split()#all the positions of the tree
 keys = key.get_pressed()
 mb=mouse.get_pressed()
@@ -618,6 +943,31 @@ for i in range(len(blockpos)):
     else:
         maptreey.append(int(blockpos[i]))
 #----------------end of load var-----------------#
+
+#----------------voxel systems--------------------#
+voxel_grid = VoxelGrid(
+    GridConfig(
+        grid_w=VOXEL_SETTINGS.grid_w,
+        grid_h=VOXEL_SETTINGS.grid_h,
+        grid_d=VOXEL_SETTINGS.grid_d,
+        tile_size=VOXEL_SETTINGS.tile_size,
+        chunk_size=VOXEL_SETTINGS.chunk_size,
+    )
+)
+voxel_grid.init_empty_world()
+iso_camera = IsometricCamera(resolution[0], resolution[1])
+particle_pool = ParticlePool(capacity=VOXEL_SETTINGS.max_particles)
+voxel_renderer = VoxelWorldRenderer(voxel_grid, iso_camera)
+block_interaction = BlockInteractionSystem(voxel_grid, particle_pool)
+debug_controls = DebugControls(
+    voxel_grid,
+    particle_pool,
+    block_interaction,
+    voxel_renderer,
+    terrain_tree_positions=list(zip(maptreex, maptreey)),
+)
+#----------------end voxel systems----------------#
+
 #----------------defining game data--------------------#
 vself=5
 venemy=2
